@@ -228,102 +228,30 @@ describe('multi-process rotation race', () => {
   });
 });
 
-describe('production dead-token handling', () => {
-  it('throws an actionable error and never opens a browser on a real HTTP-400 dead token', async () => {
-    const client = makeClient({ environment: 'production', refreshToken: 'dead-prod' });
-    fsReadFileSync.mockReturnValue(envWithToken('dead-prod'));
-    refreshDispatch.mockRejectedValue(deadTokenError(400)); // real intuit-oauth shape
+describe('non-sandbox environments are refused before any QuickBooks call', () => {
+  const refused = ['production', 'Production', 'SANDBOX', 'Sandbox', 'prod', 'sandbox ', ''];
 
-    await expect(client.authenticate()).rejects.toThrow(/cannot be renewed automatically in production/);
-    expect(serverCreated).toBe(false);
-    expect(openMock).not.toHaveBeenCalled();
-  });
-
-  it('treats a 401 as a dead token', async () => {
-    const client = makeClient({ environment: 'production', refreshToken: 'revoked' });
-    fsReadFileSync.mockReturnValue(envWithToken('revoked'));
-    refreshDispatch.mockRejectedValue(deadTokenError(401));
-
-    await expect(client.authenticate()).rejects.toThrow(/cannot be renewed automatically in production/);
-  });
-
-  it('treats an explicit invalid_grant error_description as a dead token', async () => {
-    const client = makeClient({ environment: 'production', refreshToken: 'dead2' });
-    fsReadFileSync.mockReturnValue(envWithToken('dead2'));
-    refreshDispatch.mockRejectedValue(
-      Object.assign(new Error('Request failed with status code 400'), {
-        error: 'invalid_grant',
-        error_description: 'Token invalid or expired',
-      })
+  it.each(refused)('does not construct a client for %j', (environment) => {
+    expect(() => makeClient({ environment, refreshToken: 'should-not-be-used' })).toThrow(
+      /sandbox-quickbooks\.api\.intuit\.com/
     );
-
-    await expect(client.authenticate()).rejects.toThrow(/cannot be renewed automatically in production/);
-  });
-
-  it('throws the same actionable error when a production server starts with no refresh token', async () => {
-    const client = makeClient({ environment: 'production', refreshToken: '' });
-    (client as unknown as { refreshToken?: string }).refreshToken = undefined;
-
-    await expect(client.authenticate()).rejects.toThrow(/cannot be renewed automatically in production/);
     expect(serverCreated).toBe(false);
     expect(openMock).not.toHaveBeenCalled();
+    expect(refreshDispatch).not.toHaveBeenCalled();
   });
 
-  it('does NOT report reauth for a transient error in production, and preserves the token', async () => {
-    const client = makeClient({ environment: 'production', refreshToken: 'good-but-blip' });
-    fsReadFileSync.mockReturnValue(envWithToken('good-but-blip'));
-    refreshDispatch.mockRejectedValue(new Error('getaddrinfo ETIMEDOUT api.intuit.com'));
-
-    const msg = await messageOf(client.authenticate());
-    expect(msg).toMatch(/Failed to refresh Quickbooks token/);
-    expect(msg).not.toMatch(/re-authorize|renewed automatically in production/);
-    // In-memory token is NOT cleared, so the next call self-heals.
-    expect(tokenOf(client)).toBe('good-but-blip');
-    expect(openMock).not.toHaveBeenCalled();
-  });
-
-  it('treats a 503 as transient, not a dead token', async () => {
-    const client = makeClient({ environment: 'production', refreshToken: 'fine' });
-    fsReadFileSync.mockReturnValue(envWithToken('fine'));
-    refreshDispatch.mockRejectedValue(transientError(503));
-
-    const msg = await messageOf(client.authenticate());
-    expect(msg).not.toMatch(/renewed automatically in production/);
-    expect(tokenOf(client)).toBe('fine');
-  });
-
-  it('treats a 429 rate-limit as transient, not a dead token', async () => {
-    const client = makeClient({ environment: 'production', refreshToken: 'fine429' });
-    fsReadFileSync.mockReturnValue(envWithToken('fine429'));
-    refreshDispatch.mockRejectedValue(transientError(429));
-
-    const msg = await messageOf(client.authenticate());
-    expect(msg).not.toMatch(/renewed automatically in production/);
-    expect(tokenOf(client)).toBe('fine429');
-  });
-
-  it('still succeeds in production when the refresh token is valid', async () => {
-    const client = makeClient({ environment: 'production', refreshToken: 'good-prod-token' });
-    fsReadFileSync.mockReturnValue(envWithToken('good-prod-token'));
-    refreshDispatch.mockResolvedValueOnce({ token: { access_token: 'a3', expires_in: 3600 } });
-
-    await expect(client.authenticate()).resolves.toBeDefined();
+  it('refuses authenticate if the environment field is changed after construction', async () => {
+    const client = makeClient({ environment: 'sandbox', refreshToken: 'still-sandbox' });
+    (client as unknown as { environment: string }).environment = 'production';
+    await expect(client.authenticate()).rejects.toThrow(/sandbox-quickbooks\.api\.intuit\.com/);
     expect(serverCreated).toBe(false);
-    expect(openMock).not.toHaveBeenCalled();
-  });
-
-  it('classifies a dead token carried deep in the error cause chain', async () => {
-    const client = makeClient({ environment: 'production', refreshToken: 'dead-deep' });
-    fsReadFileSync.mockReturnValue(envWithToken('dead-deep'));
-    // Real signal is two cause-levels down under generic wrappers.
-    const outer = Object.assign(new Error('transport wrapper'), {
-      cause: Object.assign(new Error('adapter wrapper'), { cause: deadTokenError(400) }),
-    });
-    refreshDispatch.mockRejectedValue(outer);
-
-    await expect(client.authenticate()).rejects.toThrow(/cannot be renewed automatically in production/);
+    expect(refreshDispatch).not.toHaveBeenCalled();
   });
 });
+
+async function waitForServer(): Promise<void> {
+  for (let i = 0; i < 50 && !serverCreated; i++) await new Promise((r) => setImmediate(r));
+}
 
 describe('sandbox transient handling', () => {
   it('does NOT launch interactive OAuth on a transient error in sandbox (preserves token)', async () => {
@@ -336,6 +264,56 @@ describe('sandbox transient handling', () => {
     expect(serverCreated).toBe(false); // no doomed/​spurious browser flow
     expect(openMock).not.toHaveBeenCalled();
     expect(tokenOf(client)).toBe('valid-sbx'); // token NOT discarded
+  });
+
+  it('treats a 401 as a dead sandbox token and opens loopback OAuth', async () => {
+    const client = makeClient({ refreshToken: 'revoked' });
+    fsReadFileSync.mockReturnValue(envWithToken('revoked'));
+    refreshDispatch.mockRejectedValue(deadTokenError(401));
+    const authPromise = client.authenticate();
+    await waitForServer();
+    expect(serverCreated).toBe(true);
+    expect(openMock).not.toHaveBeenCalled();
+    void authPromise.catch(() => {});
+  });
+
+  it('treats invalid_grant in error_description as a dead sandbox token', async () => {
+    const client = makeClient({ refreshToken: 'dead2' });
+    fsReadFileSync.mockReturnValue(envWithToken('dead2'));
+    refreshDispatch.mockRejectedValue(
+      Object.assign(new Error('Request failed with status code 400'), {
+        error: 'invalid_grant',
+        error_description: 'Token invalid or expired',
+      })
+    );
+    const authPromise = client.authenticate();
+    await waitForServer();
+    expect(serverCreated).toBe(true);
+    void authPromise.catch(() => {});
+  });
+
+  it('treats a 429 rate-limit as transient in sandbox', async () => {
+    const client = makeClient({ refreshToken: 'fine429' });
+    fsReadFileSync.mockReturnValue(envWithToken('fine429'));
+    refreshDispatch.mockRejectedValue(transientError(429));
+    const msg = await messageOf(client.authenticate());
+    expect(msg).toMatch(/Failed to refresh Quickbooks token/);
+    expect(serverCreated).toBe(false);
+    expect(tokenOf(client)).toBe('fine429');
+  });
+
+  it('classifies a dead token carried deep in the error cause chain and stays on sandbox OAuth', async () => {
+    const client = makeClient({ refreshToken: 'dead-deep' });
+    fsReadFileSync.mockReturnValue(envWithToken('dead-deep'));
+    const outer = Object.assign(new Error('transport wrapper'), {
+      cause: Object.assign(new Error('adapter wrapper'), { cause: deadTokenError(400) }),
+    });
+    refreshDispatch.mockRejectedValue(outer);
+    const authPromise = client.authenticate();
+    await waitForServer();
+    expect(serverCreated).toBe(true);
+    expect(openMock).not.toHaveBeenCalled();
+    void authPromise.catch(() => {});
   });
 
   it('DOES fall back to interactive OAuth on a genuine dead token in sandbox', async () => {

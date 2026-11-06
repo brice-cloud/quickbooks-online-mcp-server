@@ -127,9 +127,12 @@ async function uploadAttachableFile(
   const fileSize = "buffer" in file ? file.buffer.length : file.size;
   const contentLength = preamble.length + fileSize + closer.length;
 
-  const host = isSandbox
-    ? "sandbox-quickbooks.api.intuit.com"
-    : "quickbooks.api.intuit.com";
+  if (isSandbox !== true) {
+    throw new Error(
+      "Refusing QuickBooks upload: this sandbox fork only contacts sandbox-quickbooks.api.intuit.com."
+    );
+  }
+  const host = "sandbox-quickbooks.api.intuit.com";
   const requestPath = `/v3/company/${realmId}/upload`;
 
   return new Promise((resolve, reject) => {

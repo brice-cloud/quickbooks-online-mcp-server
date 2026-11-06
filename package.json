@@ -21,12 +21,12 @@
         "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage"
     },
     "dependencies": {
-        "@modelcontextprotocol/sdk": "^1.26.0",
+        "@modelcontextprotocol/sdk": "^1.32.2",
         "dotenv": "^16.4.7",
         "intuit-oauth": "^4.2.5",
         "node-quickbooks": "^2.0.43",
         "open": "^9.1.0",
-        "zod": "^3.24.2"
+        "zod": "4.6.7"
     },
     "devDependencies": {
         "@eslint/js": "^9.22.0",
@@ -48,6 +48,14 @@
             "fast-xml-parser": "^5.10.1",
             "underscore": "^1.13.8",
             "uuid": "11.1.1"
-        }
+        },
+        "axios": "1.21.0",
+        "follow-redirects": "1.16.2",
+        "proxy-addr": "2.0.8",
+        "body-parser": "2.4.0",
+        "decode-uri-component": "0.5.1",
+        "hono": "4.13.16",
+        "@hono/node-server": "2.1.6",
+        "ip-address": "10.7.6"
     }
 }

@@ -17,6 +17,8 @@
 
 ---
 
+> **Sandbox fork.** This branch refuses every QuickBooks environment except unset or the exact string `sandbox`, and it registers read tools only. `QUICKBOOKS_DISABLE_*=false` does not enable writes. Production setup below does not apply. See [docs/SANDBOX_FORK_SECURITY.md](docs/SANDBOX_FORK_SECURITY.md).
+
 ## Overview
 
 This MCP server provides complete QuickBooks Online API integration for Claude Code and other MCP-compatible clients. It includes full CRUD operations for 29 entity types and 11 financial reports, giving you comprehensive access to QuickBooks Online functionality.
@@ -387,27 +389,22 @@ If you only want to read your own company's data, you still need to set up an ap
 
 ### Production Setup
 
-The Intuit Developer Portal **rejects `http://localhost` redirect URIs in production mode** — every contributor hits this. Two known workarounds:
+This sandbox fork does not start when `QUICKBOOKS_ENVIRONMENT` is anything other than unset or the exact string `sandbox`. Exit code is 1. No production host is contacted, and there is no ngrok or public-callback path. Details and residual risks: [docs/SANDBOX_FORK_SECURITY.md](docs/SANDBOX_FORK_SECURITY.md).
 
-1. **ngrok tunnel (most common):** run `ngrok http 8000`, then on your Intuit app go to **Settings → Redirect URIs** and add the generated `https://<id>.ngrok-free.app/callback` URL. Use that URL for the OAuth handshake, then revert to localhost afterwards.
-2. **Deploy a small public callback handler** (e.g., on a VPS or serverless function) that captures the auth code and hands it back to your local setup. More involved; only needed if you can't use ngrok.
-
-After completing the production OAuth handshake, the refresh token is what matters — once it's in `.env`, you no longer need the public redirect URL for day-to-day use. Refresh tokens auto-rotate; the server persists the new token on each refresh.
-
-### Once you have tokens
+### Once you have sandbox tokens
 
 ```env
-QUICKBOOKS_CLIENT_ID=your_client_id
-QUICKBOOKS_CLIENT_SECRET=your_client_secret
-QUICKBOOKS_REFRESH_TOKEN=your_refresh_token
-QUICKBOOKS_REALM_ID=your_realm_id
-QUICKBOOKS_ENVIRONMENT=sandbox  # or 'production'
+QUICKBOOKS_CLIENT_ID=your_sandbox_client_id
+QUICKBOOKS_CLIENT_SECRET=your_sandbox_client_secret
+QUICKBOOKS_REFRESH_TOKEN=your_sandbox_refresh_token
+QUICKBOOKS_REALM_ID=your_sandbox_realm_id
+QUICKBOOKS_ENVIRONMENT=sandbox
 ```
 
 ### Common pitfalls
 
-- **`.env` loaded from the wrong directory.** The server resolves `.env` relative to the compiled module, not your shell's CWD. If you launch via Claude Desktop, this matters — make sure you're on current `main`.
-- **Redirect URI mismatch.** The URI you register in the Intuit portal must match **exactly** — protocol, host, port, path. `http://localhost:8000/callback` .
+- **`.env` loaded from the wrong directory.** The server resolves the token file from `QUICKBOOKS_TOKEN_STORE_PATH` or from the compiled module, not from the shell's CWD.
+- **Redirect URI mismatch.** Register exactly `http://localhost:8000/callback`. Intuit's developer UI rejects an IP address in the redirect URI. The process still listens only on `127.0.0.1` and `::1`.
 
 ---
 

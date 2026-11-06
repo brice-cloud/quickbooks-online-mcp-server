@@ -7,6 +7,22 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import open from 'open';
+import {
+  armOAuthTimeout,
+  assertSandboxEnvironment,
+  failClosed,
+  OAUTH_CALLBACK_TIMEOUT_MS,
+  OAUTH_LOOPBACK_HOSTS,
+  OAUTH_PORT,
+  OAUTH_REDIRECT_URI,
+  isLocalhostCallbackHost,
+  isLoopbackRemoteAddress,
+  readAndApplyTokenFile,
+  SANDBOX_API_HOST,
+  SANDBOX_ENVIRONMENT,
+  statesMatch,
+} from "./sandbox-policy.js";
+import { withTokenLock } from "./token-lock.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -27,39 +43,62 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // default exists to avoid).
 const tokenStorePathOverride = process.env.QUICKBOOKS_TOKEN_STORE_PATH?.trim();
 if (tokenStorePathOverride && !path.isAbsolute(tokenStorePathOverride)) {
-  throw Error(
+  failClosed(
     `QUICKBOOKS_TOKEN_STORE_PATH must be an absolute path, got "${tokenStorePathOverride}"`
   );
 }
 const TOKEN_STORE_PATH =
   tokenStorePathOverride || path.join(__dirname, '..', '..', '.env');
 
-// Use override: true so that values from the token store always win over any
-// empty-string placeholders a host app (e.g. Claude Desktop) may inject via
-// its env config. This prevents the server from starting with blank
-// REFRESH_TOKEN / REALM_ID even when the host config has those keys set to "".
-dotenv.config({ path: TOKEN_STORE_PATH, override: true });
+// Refuse a non-sandbox process environment before the token file is read, so
+// the file cannot change a production request into a startup.
+try {
+  assertSandboxEnvironment(process.env.QUICKBOOKS_ENVIRONMENT, 'the process environment');
+} catch (err) {
+  failClosed(err instanceof Error ? err.message : String(err));
+}
 
-// Register once at module level — registering inside startOAuthFlow() would
-// accumulate duplicate handlers on every OAuth call.
-process.on('uncaughtException', (err) => {
-  console.error('[auth-server] uncaughtException:', err);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[auth-server] unhandledRejection:', reason);
-});
+// The token file may supply rotated credentials. It may not change the host
+// or the tool policy. dotenv override:true used to let the file replace
+// QUICKBOOKS_ENVIRONMENT and QUICKBOOKS_DISABLE_* after those had been read.
+try {
+  const raw = fs.readFileSync(TOKEN_STORE_PATH, 'utf8');
+  if (typeof raw === 'string') {
+    readAndApplyTokenFile(
+      raw,
+      process.env,
+      (source) => dotenv.parse(source),
+      `token file ${TOKEN_STORE_PATH}`
+    );
+  }
+} catch (err) {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  if (code === 'ENOENT') {
+    /* No token file yet. Process environment was already checked. */
+  } else if (code === 'QBO_SANDBOX_REQUIRED' || err instanceof Error && err.name === 'SandboxRefusal') {
+    failClosed(err instanceof Error ? err.message : String(err));
+  } else if (err instanceof Error && err.message.startsWith('Refusing to start')) {
+    failClosed(err.message);
+  } else if (code) {
+    failClosed(`Refusing to start: cannot read token file ${TOKEN_STORE_PATH} (${code}).`);
+  } else {
+    throw err;
+  }
+}
+
+process.env.QUICKBOOKS_ENVIRONMENT = SANDBOX_ENVIRONMENT;
 
 const client_id = process.env.QUICKBOOKS_CLIENT_ID;
 const client_secret = process.env.QUICKBOOKS_CLIENT_SECRET;
 const refresh_token = process.env.QUICKBOOKS_REFRESH_TOKEN;
 const realm_id = process.env.QUICKBOOKS_REALM_ID;
-const environment = process.env.QUICKBOOKS_ENVIRONMENT || 'sandbox';
-// Fix for Issue #5: Use env var with underscore (QUICKBOOKS_REDIRECT_URI)
-const redirect_uri = process.env.QUICKBOOKS_REDIRECT_URI || 'http://localhost:8000/callback';
+const environment = SANDBOX_ENVIRONMENT;
+const redirect_uri = process.env.QUICKBOOKS_REDIRECT_URI || OAUTH_REDIRECT_URI;
 
-// Only throw error if client_id or client_secret is missing
 if (!client_id || !client_secret || !redirect_uri) {
-  throw Error("Client ID, Client Secret and Redirect URI must be set in environment variables");
+  failClosed(
+    "QUICKBOOKS_CLIENT_ID and QUICKBOOKS_CLIENT_SECRET must be set in the process environment or the token file. Refusing to start."
+  );
 }
 
 // ── QuickbooksClient ─────────────────────────────────────────────────────────
@@ -100,11 +139,17 @@ export class QuickbooksClient {
     environment: string;
     redirectUri: string;
   }) {
+    if (config.environment !== SANDBOX_ENVIRONMENT) {
+      throw new Error(
+        `Refusing to construct QuickbooksClient for environment ${JSON.stringify(config.environment)}. ` +
+          `This sandbox fork only uses ${SANDBOX_API_HOST}.`
+      );
+    }
     this.clientId = config.clientId;
     this.clientSecret = config.clientSecret;
     this.refreshToken = config.refreshToken;
     this.realmId = config.realmId;
-    this.environment = config.environment;
+    this.environment = SANDBOX_ENVIRONMENT;
     this.redirectUri = config.redirectUri;
     this.oauthClient = new OAuthClient({
       clientId: this.clientId,
@@ -231,55 +276,47 @@ export class QuickbooksClient {
     };
   }
 
-  // The actionable error surfaced when a production server's refresh token is
-  // dead. The interactive localhost flow cannot recover it — Intuit rejects the
-  // localhost redirect for production apps, and no human is present to complete
-  // a browser login in a host-spawned stdio subprocess — so we fail with
-  // instructions instead of opening a browser window that can never succeed.
-  private reauthError(cause?: string): Error {
-    const msg =
-      'QuickBooks authorization is invalid or expired and cannot be renewed automatically in ' +
-      'production. Re-authorize this company using a public HTTPS redirect (see the "Production ' +
-      'Setup" section of the README), then restart the server. Note: an HTTP 401 from the token ' +
-      'endpoint usually means invalid_client — verify QUICKBOOKS_CLIENT_ID and ' +
-      'QUICKBOOKS_CLIENT_SECRET before re-authorizing.';
-    return new Error(cause ? `${msg} (cause: ${cause})` : msg);
+  private assertSandbox(action: string): void {
+    if (this.environment !== SANDBOX_ENVIRONMENT) {
+      throw new Error(
+        `Refusing to ${action}: this sandbox fork only contacts ${SANDBOX_API_HOST}.`
+      );
+    }
   }
 
   private async startOAuthFlow(): Promise<void> {
-    // The interactive flow below binds a localhost callback server, but Intuit
-    // rejects localhost redirect URIs for production apps — so this can only
-    // ever succeed in sandbox. Fail fast with guidance rather than opening a
-    // doomed browser window on a production server.
-    if (this.environment === 'production') {
-      throw this.reauthError();
-    }
+    this.assertSandbox('start QuickBooks OAuth');
 
     if (this.isAuthenticating) {
       return;
     }
 
     this.isAuthenticating = true;
-    const port = 8000;
+    const port = OAUTH_PORT;
 
-    // The local server below receives the callback, so the authorize/exchange
-    // pair must use the localhost redirect even when QUICKBOOKS_REDIRECT_URI
-    // points elsewhere (e.g. the OAuth playground used for manual token
-    // generation). Intuit rejects the exchange if the redirect_uri does not
-    // match the one used in the authorize request.
+    // Intuit's developer UI accepts http://localhost:8000/callback and rejects
+    // an IP literal. The sockets below are still loopback-only. The flow
+    // ignores QUICKBOOKS_REDIRECT_URI so authorize and token exchange match.
     const flowClient = new OAuthClient({
       clientId: this.clientId,
       clientSecret: this.clientSecret,
-      environment: this.environment,
-      redirectUri: `http://localhost:${port}/callback`,
+      environment: SANDBOX_ENVIRONMENT,
+      redirectUri: OAUTH_REDIRECT_URI,
     });
 
     return new Promise((resolve, reject) => {
-      // Guard against duplicate /callback requests for the same authorization
-      // code. Browsers resolve `localhost` to both 127.0.0.1 and ::1, and the
-      // server binds dual-stack (`::`), so the redirect frequently lands twice.
-      // Exchanging a one-time auth code a second time trips Intuit's replay
-      // protection, which REVOKES the tokens issued by the first exchange
+      let settled = false;
+      let cancelTimeout: () => void = () => {};
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        cancelTimeout();
+        fn();
+      };
+
+      // Guard against duplicate /callback requests. localhost may connect to
+      // 127.0.0.1 and ::1, so the same code can arrive twice. Exchanging it
+      // twice trips Intuit's replay protection and REVOKES the first tokens
       // (RFC 6749 §4.1.2). Only the first callback may exchange the code.
       let codeExchangeStarted = false;
 
@@ -290,15 +327,33 @@ export class QuickbooksClient {
       // tokens written into our .env instead of ours.
       const expectedState = crypto.randomBytes(24).toString('hex');
 
-      // Create temporary server for OAuth callback
-      const server = http.createServer(async (req, res) => {
-        console.log(`[auth-server] ${req.method} ${req.url}`);
+      const servers: http.Server[] = [];
+      const closeServers = () => {
+        for (const openServer of servers) {
+          try { openServer.close(); } catch { /* already closed */ }
+        }
+      };
+
+      // Create temporary servers for the OAuth callback. One handler is shared.
+      const onRequest = async (req: http.IncomingMessage, res: http.ServerResponse) => {
+        const callbackPath = req.url?.split('?')[0] ?? '';
+        console.log(`[auth-server] ${req.method} ${callbackPath}`);
 
         // Respond to anything that isn't /callback so diagnostic probes (curl,
-        // ngrok health checks, favicon requests, etc.) don't hang the server.
+        // favicon requests, etc.) don't hang the server.
         if (!req.url?.startsWith('/callback')) {
           res.writeHead(404, { 'Content-Type': 'text/plain' });
           res.end('Not Found. Waiting for QuickBooks OAuth callback at /callback');
+          return;
+        }
+
+        // The socket must be loopback, and the Host header must be the
+        // registered hostname. An IP Host or a public Host is rejected even
+        // if it reached a loopback socket.
+        if (!isLoopbackRemoteAddress(req.socket?.remoteAddress) || !isLocalhostCallbackHost(req.headers?.host)) {
+          console.error('[auth-server] Rejected callback that was not addressed to localhost on a loopback socket');
+          res.writeHead(403, { 'Content-Type': 'text/plain' });
+          res.end('Forbidden.');
           return;
         }
 
@@ -306,9 +361,9 @@ export class QuickbooksClient {
         // request, before touching codeExchangeStarted, so a spoofed/scanner
         // hit can't consume the one-shot exchange lock and lock out the real
         // callback that follows it.
-        const incomingState = new URL(req.url, `http://localhost:${port}`).searchParams.get('state');
-        if (incomingState !== expectedState) {
-          console.log(`[auth-server] Rejected callback with mismatched state (got: ${incomingState ?? 'none'})`);
+        const incomingState = new URL(req.url, OAUTH_REDIRECT_URI).searchParams.get('state');
+        if (!statesMatch(expectedState, incomingState)) {
+          console.error('[auth-server] Rejected callback with mismatched or missing state');
           res.writeHead(400, { 'Content-Type': 'text/plain' });
           res.end('Invalid or missing state parameter.');
           return;
@@ -330,10 +385,12 @@ export class QuickbooksClient {
             const response = await flowClient.createToken(req.url);
             const tokens = response.token;
 
-            // Save tokens
+            // Save tokens under the same file lock used for refresh rotation.
             this.refreshToken = tokens.refresh_token;
             this.realmId = tokens.realmId;
-            this.saveTokensToEnv();
+            await withTokenLock(TOKEN_STORE_PATH, async () => {
+              this.saveTokensToEnv();
+            });
 
             // Send success response
             res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -357,9 +414,11 @@ export class QuickbooksClient {
 
             // Close server after a short delay
             setTimeout(() => {
-              server.close();
-              this.isAuthenticating = false;
-              resolve();
+              settle(() => {
+                closeServers();
+                this.isAuthenticating = false;
+                resolve();
+              });
             }, 1000);
           } catch (error) {
             console.error('Error during token creation:', error);
@@ -381,19 +440,29 @@ export class QuickbooksClient {
                 </body>
               </html>
             `);
-            this.isAuthenticating = false;
-            reject(error);
+            settle(() => {
+              this.isAuthenticating = false;
+              reject(error);
+            });
           }
         }
+      };
+
+      cancelTimeout = armOAuthTimeout(() => {
+        settle(() => {
+          this.isAuthenticating = false;
+          closeServers();
+          reject(new Error(
+            `QuickBooks sandbox OAuth timed out after ${OAUTH_CALLBACK_TIMEOUT_MS}ms ` +
+              `waiting for ${OAUTH_REDIRECT_URI}.`
+          ));
+        });
       });
 
-      // Start server — bind to all interfaces (IPv4 + IPv6) so ngrok can reach it
-      // regardless of whether it resolves `localhost` to 127.0.0.1 or ::1
-      server.listen(port, '::', async () => {
-        const addr = server.address();
-        console.log(`[auth-server] Listening on ${typeof addr === 'string' ? addr : `${addr?.address}:${addr?.port}`} (family: ${typeof addr === 'object' ? addr?.family : 'n/a'})`);
-
-        // Generate authorization URL with proper type assertion
+      let announced = false;
+      const announce = async () => {
+        if (announced || settled) return;
+        announced = true;
         const authUri = flowClient.authorizeUri({
           scope: [OAuthClient.scopes.Accounting as string],
           state: expectedState
@@ -404,20 +473,38 @@ export class QuickbooksClient {
         console.log(authUri);
         console.log('\nWaiting for callback...\n');
 
-        // Attempt to open the browser automatically; ignore failures on headless systems
         try {
           await open(authUri);
         } catch {
           // Headless environment — user will open the URL manually
         }
-      });
+      };
 
-      // Handle server errors
-      server.on('error', (error) => {
-        console.error('Server error:', error);
-        this.isAuthenticating = false;
-        reject(error);
-      });
+      // Loopback sockets only. Do not bind "::" or 0.0.0.0. localhost in the
+      // redirect may resolve to either address; both listeners share one handler.
+      for (const host of OAUTH_LOOPBACK_HOSTS) {
+        const server = http.createServer(onRequest);
+        servers.push(server);
+        server.on('error', (error: NodeJS.ErrnoException) => {
+          const ipv6Unavailable = host === '::1'
+            && (error.code === 'EAFNOSUPPORT' || error.code === 'EADDRNOTAVAIL' || error.code === 'EINVAL');
+          if (ipv6Unavailable) {
+            console.error(`[auth-server] IPv6 loopback is unavailable (${error.code}). Continuing on 127.0.0.1.`);
+            return;
+          }
+          console.error('Server error:', error);
+          settle(() => {
+            closeServers();
+            this.isAuthenticating = false;
+            reject(error);
+          });
+        });
+        server.listen(port, host, () => {
+          const addr = server.address();
+          console.log(`[auth-server] Listening on ${typeof addr === 'string' ? addr : `${addr?.address}:${addr?.port}`} (family: ${typeof addr === 'object' ? addr?.family : 'n/a'})`);
+          void announce();
+        });
+      }
     });
   }
 
@@ -439,48 +526,33 @@ export class QuickbooksClient {
     if (this.realmId) updateEnvVar('QUICKBOOKS_REALM_ID', this.realmId);
 
     const newContent = envLines.join('\n');
-    const isSymlink = this.isSymbolicLink(tokenPath);
+    // Resolve a symlink to its target, then rename a temp file onto that
+    // target. Renaming onto the symlink path would replace the link itself.
+    const destination = this.resolveTokenDestination(tokenPath);
+    const tmpPath = `${destination}.tmp.${process.pid}`;
+    try {
+      fs.writeFileSync(tmpPath, newContent, { mode: 0o600 });
+      fs.renameSync(tmpPath, destination);
+    } catch (err) {
+      try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
+      throw err;
+    }
+  }
 
-    if (isSymlink) {
-      // Write directly through the symlink to the real target. Using
-      // rename on a symlink replaces the link itself rather than writing
-      // through it, which breaks persistent-volume mounts in containers.
-      // If the symlink target doesn't exist yet (fresh PVC mount), resolve
-      // the link target without requiring it to exist, then write directly.
-      let realPath: string;
-      try {
-        realPath = fs.realpathSync(tokenPath);
-      } catch (e: any) {
-        if (e?.code === 'ENOENT') {
-          // Dangling symlink: target doesn't exist yet. readlinkSync returns the
-          // link target as stored, which may be RELATIVE — and a relative path is
-          // resolved against the process cwd, not the link's own directory. Resolve
-          // it against the symlink's directory so we write to the intended location.
-          const linkTarget = fs.readlinkSync(tokenPath);
-          realPath = path.isAbsolute(linkTarget)
-            ? linkTarget
-            : path.resolve(path.dirname(tokenPath), linkTarget);
-        } else {
-          throw e;
-        }
+  private resolveTokenDestination(tokenPath: string): string {
+    if (!this.isSymbolicLink(tokenPath)) return tokenPath;
+    try {
+      return fs.realpathSync(tokenPath);
+    } catch (e: any) {
+      if (e?.code === 'ENOENT') {
+        // Dangling symlink. readlinkSync may return a relative target, which
+        // must be resolved against the link's directory, not the process cwd.
+        const linkTarget = fs.readlinkSync(tokenPath);
+        return path.isAbsolute(linkTarget)
+          ? linkTarget
+          : path.resolve(path.dirname(tokenPath), linkTarget);
       }
-      // Deliberate: no temp-file+rename here. Renaming over a symlink replaces the
-      // link itself (the bug this branch fixes), so we write through to the target
-      // directly. This trades atomicity for correct persistent-volume behavior — a
-      // crash mid-write could leave the target .env partially written.
-      fs.writeFileSync(realPath, newContent, { mode: 0o600 });
-    } else {
-      // Atomic write: write to a sibling temp file, then rename. On POSIX
-      // rename is atomic within the same filesystem, so a crash mid-write
-      // cannot leave .env half-written or empty.
-      const tmpPath = `${tokenPath}.tmp.${process.pid}`;
-      try {
-        fs.writeFileSync(tmpPath, newContent, { mode: 0o600 });
-        fs.renameSync(tmpPath, tokenPath);
-      } catch (err) {
-        try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
-        throw err;
-      }
+      throw e;
     }
   }
 
@@ -493,6 +565,7 @@ export class QuickbooksClient {
   }
 
   async refreshAccessToken() {
+    this.assertSandbox('refresh a QuickBooks access token');
     if (!this.refreshToken) {
       await this.startOAuthFlow();
 
@@ -508,8 +581,10 @@ export class QuickbooksClient {
 
     this.refreshInFlight = (async () => {
       try {
-        // Multi-process rotation-race fix. We refresh with our in-memory token
-        // first and only consult .env AFTER it is rejected — so a valid token,
+        return await withTokenLock(TOKEN_STORE_PATH, async () => {
+        // Multi-process rotation-race fix. The lock is held for this refresh
+        // and its persist. The in-memory token is used first and .env is
+        // consulted only after that token is rejected — so a valid token,
         // including one this process just rotated but could not persist, is
         // never proactively discarded. A sibling process sharing this .env may
         // have rotated the token (Intuit invalidates the prior one on
@@ -565,16 +640,17 @@ export class QuickbooksClient {
         const refreshExpiresIn = token.x_refresh_token_expires_in;
         if (typeof refreshExpiresIn === 'number' && refreshExpiresIn < 14 * 24 * 3600) {
           const days = Math.round(refreshExpiresIn / 86400);
-          const renewHint = this.environment === 'production'
-            ? 'Re-authorize before it expires (see README "Production Setup").'
-            : 'Re-run `npm run auth` before it expires.';
-          console.error(`[qbo-client] WARNING: refresh token expires in ~${days} day(s). ${renewHint}`);
+          console.error(
+            `[qbo-client] WARNING: refresh token expires in ~${days} day(s). ` +
+              'Re-run `npm run auth` against the sandbox company before it expires.'
+          );
         }
 
         return {
           access_token: this.accessToken!,
           expires_in: expiresIn,
         };
+        });
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
         // Preserve the original error as `cause` so the caller can classify it
@@ -599,6 +675,7 @@ export class QuickbooksClient {
 
     this.authInFlight = (async () => {
       try {
+        this.assertSandbox('authenticate to QuickBooks');
         if (!this.refreshToken || !this.realmId) {
           await this.startOAuthFlow();
 
@@ -622,16 +699,10 @@ export class QuickbooksClient {
             if (!this.isAuthInvalidation(error)) {
               throw error;
             }
-            // Past here the refresh token is genuinely dead (revoked, expired
-            // past the 100-day window, or rotated out).
-            if (this.environment === 'production') {
-              // The interactive fallback cannot help (localhost redirect is
-              // rejected, and nobody is watching a host-spawned subprocess to
-              // complete a browser login). Surface an actionable error.
-              throw this.reauthError(message);
-            }
-            // Sandbox: recoverable via the localhost interactive OAuth flow.
-            console.error(`[qbo-client] Refresh token rejected (${message}); falling back to interactive OAuth`);
+            // The refresh token is dead. This fork has no production re-auth
+            // path and will not contact the production accounting host.
+            this.assertSandbox('recover a rejected QuickBooks refresh token');
+            console.error(`[qbo-client] Refresh token rejected (${message}); falling back to interactive sandbox OAuth`);
             this.refreshToken = undefined;
             this.accessToken = undefined;
             this.accessTokenExpiry = undefined;
@@ -648,7 +719,7 @@ export class QuickbooksClient {
           this.accessToken!,
           false, // no token secret for OAuth 2.0
           this.realmId!,
-          this.environment === 'sandbox',
+          true, // sandbox host only; production is not a fallback
           false, // debug?
           null,  // minor version
           '2.0', // oauth version
@@ -688,10 +759,11 @@ export class QuickbooksClient {
     if (!quickbooksClient.accessToken || !quickbooksClient.realmId) {
       throw new Error('Quickbooks not authenticated');
     }
+    quickbooksClient.assertSandbox('return QuickBooks credentials');
     return {
       accessToken: quickbooksClient.accessToken,
       realmId: quickbooksClient.realmId,
-      isSandbox: quickbooksClient.environment === 'sandbox',
+      isSandbox: true,
     };
   }
 

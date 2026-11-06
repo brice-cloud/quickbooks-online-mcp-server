@@ -5,6 +5,18 @@ All notable changes to the QuickBooks Online MCP Server are documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - sandbox fork hardening
+
+### Security
+
+- Refuse every `QUICKBOOKS_ENVIRONMENT` value except unset or the exact string `sandbox`, including values from the token file. Exit 1. No production accounting host.
+- Register only an explicit read-only tool allowlist. `QUICKBOOKS_DISABLE_*` cannot enable create, update, or delete tools. `SANDBOX_WRITE_EXCEPTIONS` is empty, so `create_deposit` stays unregistered.
+- Bind the OAuth callback to loopback `127.0.0.1` and `::1`, require Host `localhost:8000`, and register `http://localhost:8000/callback` with Intuit. Compare `state` with `timingSafeEqual`, redact the callback query from logs, and time out the listener.
+- Lock the token file across refresh and persist, and rename onto the resolved token path.
+- Fatal configuration calls `process.exit(1)` instead of an `uncaughtException` handler that could exit 0.
+- Override patched `axios`, `follow-redirects`, `proxy-addr`, `body-parser`, and `decode-uri-component` where the existing majors allow it. Bump `@modelcontextprotocol/sdk` to 1.32.2.
+- Depend on Zod 4.6.7. GitHub advisory GHSA-mrhx-c7xc-m3w5 is fixed starting at 4.6.6. `z.record(value)` call sites now pass an explicit string key schema, which is what Zod 4 requires and what Zod 3's one-argument record meant.
+
 ## [0.0.1] - 2024-01-13
 
 ### Summary

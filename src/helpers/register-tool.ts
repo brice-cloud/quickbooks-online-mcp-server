@@ -49,20 +49,111 @@ export function getCrudCategory(toolName: string): CrudCategory {
   return CRUD_CATEGORY.READ;
 }
 
-/** 
- * Checks if a tool is disabled based on its CRUD category and corresponding environment variable.
- * READ tools are never disabled.
+/**
+ * Future narrow writes, such as a reviewed sandbox `create_deposit` trial,
+ * require a code change that adds the tool name to this list.
+ * The list is intentionally empty. Environment variables and the token file
+ * cannot add to it.
  */
-export function isToolDisabled(toolName: string): boolean {
-  const category = getCrudCategory(toolName);
-  if (category === CRUD_CATEGORY.READ) return false;
-  return process.env[DISABLE_ENV[category]] === "true";
+export const SANDBOX_WRITE_EXCEPTIONS: readonly string[] = Object.freeze([]);
+
+/**
+ * Read tools this fork may register. A name that is not on this list is not
+ * registered, including new tools and any create/update/delete name.
+ * QUICKBOOKS_DISABLE_WRITE, QUICKBOOKS_DISABLE_UPDATE, and QUICKBOOKS_DISABLE_DELETE
+ * cannot turn a tool on. Setting them to "false" does not unlock writes.
+ */
+export const READ_ONLY_TOOL_ALLOWLIST: ReadonlySet<string> = new Set([
+  "get-bill",
+  "get-vendor",
+  "get_account",
+  "get_aged_payables",
+  "get_aged_receivables",
+  "get_attachable",
+  "get_balance_sheet",
+  "get_bill_payment",
+  "get_cash_flow",
+  "get_class",
+  "get_company_info",
+  "get_credit_memo",
+  "get_customer",
+  "get_customer_balance",
+  "get_customer_sales",
+  "get_department",
+  "get_deposit",
+  "get_employee",
+  "get_estimate",
+  "get_general_ledger",
+  "get_invoice_pdf",
+  "get_journal_entry",
+  "get_payment",
+  "get_payment_method",
+  "get_preferences",
+  "get_profit_and_loss",
+  "get_purchase",
+  "get_purchase_order",
+  "get_refund_receipt",
+  "get_sales_receipt",
+  "get_tax_agency",
+  "get_tax_code",
+  "get_tax_rate",
+  "get_term",
+  "get_time_activity",
+  "get_transfer",
+  "get_trial_balance",
+  "get_vendor_balance",
+  "get_vendor_credit",
+  "get_vendor_expenses",
+  "read_invoice",
+  "read_item",
+  "search_accounts",
+  "search_attachables",
+  "search_bill_payments",
+  "search_bills",
+  "search_budgets",
+  "search_classes",
+  "search_credit_memos",
+  "search_customers",
+  "search_departments",
+  "search_deposits",
+  "search_employees",
+  "search_estimates",
+  "search_invoices",
+  "search_items",
+  "search_journal_entries",
+  "search_payment_methods",
+  "search_payments",
+  "search_purchase_orders",
+  "search_purchases",
+  "search_refund_receipts",
+  "search_sales_receipts",
+  "search_tax_agencies",
+  "search_tax_codes",
+  "search_tax_rates",
+  "search_terms",
+  "search_time_activities",
+  "search_transfers",
+  "search_vendor_credits",
+  "search_vendors",
+]);
+
+/**
+ * Mutating tools are always disabled in this fork unless the name is listed in
+ * SANDBOX_WRITE_EXCEPTIONS. Read tools register only when they are on the allowlist.
+ * The DISABLE_* environment variables are ignored so a token file cannot turn writes on.
+ */
+export function isToolDisabled(
+  toolName: string,
+  exceptions: readonly string[] = SANDBOX_WRITE_EXCEPTIONS
+): boolean {
+  if (exceptions.includes(toolName)) return false;
+  if (getCrudCategory(toolName) !== CRUD_CATEGORY.READ) return true;
+  return !READ_ONLY_TOOL_ALLOWLIST.has(toolName);
 }
 
 /** 
- * Registers a tool with the MCP server if it is not disabled.
- * Tools are categorized by their name prefix (e.g. create_, update_, delete_).
- * The corresponding environment variable (e.g. QUICKBOOKS_DISABLE_WRITE) determines if the tool is registered.
+ * Registers a tool when this sandbox fork's allowlist permits it.
+ * create_, update_, and delete_ tools are not registered. Env flags cannot enable them.
  */
 /**
  * Unsupported-parameter reporting.

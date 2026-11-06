@@ -7,7 +7,7 @@
  *
  * Covers:
  * 1. Regular file: atomic temp+rename path (existing behavior).
- * 2. Symlinked .env: writes through to realpathSync target, no rename.
+ * 2. Symlinked .env: atomic rename onto the realpath target, not onto the link.
  * 3. Dangling symlink: readlinkSync fallback when target doesn't exist.
  * 4. isSymbolicLink: fails closed (returns false) on any fs error.
  */
@@ -122,15 +122,17 @@ describe('saveTokensToEnv (via authenticate)', () => {
     expect(writeFileSyncSpy).toHaveBeenCalled();
   });
 
-  it('writes through symlink target via realpathSync (no rename)', async () => {
+  it('atomically renames onto the symlink target, not onto the link', async () => {
     lstatBehavior = 'symlink';
     realpathBehavior = 'ok';
 
     await quickbooksClient.authenticate();
 
-    expect(renameSyncSpy).not.toHaveBeenCalled();
+    const tokenWrite = renameSyncSpy.mock.calls.find(([, dest]) => dest === REAL_PATH);
+    expect(tokenWrite).toBeDefined();
+    expect(String(tokenWrite?.[0]).startsWith(`${REAL_PATH}.tmp.`)).toBe(true);
     expect(writeFileSyncSpy).toHaveBeenCalledWith(
-      REAL_PATH,
+      tokenWrite?.[0],
       expect.stringContaining(`QUICKBOOKS_REFRESH_TOKEN=rotated-${tokenCounter}`),
       expect.objectContaining({ mode: 0o600 }),
     );
@@ -143,9 +145,10 @@ describe('saveTokensToEnv (via authenticate)', () => {
 
     await quickbooksClient.authenticate();
 
-    expect(renameSyncSpy).not.toHaveBeenCalled();
+    const tokenWrite = renameSyncSpy.mock.calls.find(([, dest]) => dest === LINK_TARGET);
+    expect(tokenWrite).toBeDefined();
     expect(writeFileSyncSpy).toHaveBeenCalledWith(
-      LINK_TARGET,
+      tokenWrite?.[0],
       expect.stringContaining(`QUICKBOOKS_REFRESH_TOKEN=rotated-${tokenCounter}`),
       expect.objectContaining({ mode: 0o600 }),
     );
@@ -160,12 +163,10 @@ describe('saveTokensToEnv (via authenticate)', () => {
 
     await quickbooksClient.authenticate();
 
-    expect(renameSyncSpy).not.toHaveBeenCalled();
-    // tokenPath is <install>/.env; dirname is <install>; ../data/.env resolves to
-    // <install>/../data/.env. Assert the written path ends with the resolved suffix
-    // and is absolute (not the bare relative string, and not cwd-relative).
-    const writtenPath = writeFileSyncSpy.mock.calls[writeFileSyncSpy.mock.calls.length - 1][0] as string;
-    expect(writtenPath).not.toBe('../data/.env'); // not written verbatim
+    const tokenWrite = renameSyncSpy.mock.calls.find(([, dest]) => path.isAbsolute(String(dest)) && String(dest).endsWith(path.join('data', '.env')));
+    expect(tokenWrite).toBeDefined();
+    const writtenPath = String(tokenWrite?.[1]);
+    expect(writtenPath).not.toBe('../data/.env');
     expect(path.isAbsolute(writtenPath)).toBe(true);
     expect(writtenPath.endsWith(path.join('data', '.env'))).toBe(true);
   });

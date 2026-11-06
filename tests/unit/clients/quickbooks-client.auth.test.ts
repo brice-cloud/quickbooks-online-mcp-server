@@ -60,9 +60,12 @@ jest.unstable_mockModule('intuit-oauth', () => {
   return { default: MockOAuthClient };
 });
 
+const quickBooksArgs: unknown[][] = [];
 jest.unstable_mockModule('node-quickbooks', () => ({
   default: class MockQuickBooks {
-    constructor(..._args: unknown[]) {}
+    constructor(...args: unknown[]) {
+      quickBooksArgs.push(args);
+    }
   },
 }));
 
@@ -105,7 +108,7 @@ jest.unstable_mockModule('fs', () => ({
   },
 }));
 
-const { quickbooksClient } = await import('../../../src/clients/quickbooks-client');
+const { quickbooksClient, QuickbooksClient } = await import('../../../src/clients/quickbooks-client');
 
 // Polls until the OAuth callback handler has been registered by startOAuthFlow.
 async function untilCallbackRegistered(timeoutMs = 2000): Promise<void> {
@@ -137,7 +140,10 @@ describe('QuickbooksClient.authenticate', () => {
     // Only the module-level client exists; no flow client was constructed.
     expect(oauthInstances).toHaveLength(1);
     expect(oauthInstances[0].cfg.redirectUri).toBe(process.env.QUICKBOOKS_REDIRECT_URI);
+    expect(oauthInstances[0].cfg.environment).toBe('sandbox');
     expect(callbackHandler).toBeUndefined();
+    expect(quickBooksArgs.at(-1)?.[5]).toBe(true);
+    await expect(QuickbooksClient.getAuthCredentials()).resolves.toMatchObject({ isSandbox: true });
   });
 
   it('falls back to the interactive OAuth flow when the refresh token is rejected, and uses the localhost redirect', async () => {
@@ -163,7 +169,9 @@ describe('QuickbooksClient.authenticate', () => {
     // redirect (NOT the playground URI from the environment).
     expect(oauthInstances).toHaveLength(2);
     const flowClient = oauthInstances[1];
-    expect(flowClient.cfg.redirectUri).toBe('http://localhost:8000/callback');
+    expect(flowClient.cfg.redirectUri).toBe('http://127.0.0.1:8000/callback');
+    expect(flowClient.cfg.environment).toBe('sandbox');
+    expect(fakeServer.listen).toHaveBeenCalledWith(8000, '127.0.0.1', expect.any(Function));
 
     // The state actually used is a random per-run value, not a fixed literal —
     // read it off the authorizeUri() call so the simulated callback matches it.

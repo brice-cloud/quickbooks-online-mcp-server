@@ -278,7 +278,7 @@ describe('Company and Attachable Handlers', () => {
       expect(reqOptions.headers.Authorization).toBe('Bearer mock-access-token');
     });
 
-    it('should select production host when isSandbox is false', async () => {
+    it('should refuse the upload when isSandbox is false', async () => {
       const { mockAuthCredentials } = await import('../../mocks/quickbooks.mock');
       (mockQuickbooksClientClass.getAuthCredentials as any).mockResolvedValue({
         ...mockAuthCredentials,
@@ -286,14 +286,15 @@ describe('Company and Attachable Handlers', () => {
       });
       mockHttpsUploadResponse(200, { AttachableResponse: [] });
 
-      await createQuickbooksAttachable({
+      const result = await createQuickbooksAttachable({
         file_name: 'doc.pdf',
         content_type: 'application/pdf',
         base64_content: Buffer.from('x').toString('base64'),
       });
 
-      const [[reqOptions]] = (mockHttpsRequest as jest.Mock).mock.calls as any[][];
-      expect(reqOptions.hostname).toBe('quickbooks.api.intuit.com');
+      expect(result.isError).toBe(true);
+      expect(result.error).toContain('sandbox-quickbooks.api.intuit.com');
+      expect(mockHttpsRequest).not.toHaveBeenCalled();
     });
 
     it('should reject unsupported content_type before any upload', async () => {

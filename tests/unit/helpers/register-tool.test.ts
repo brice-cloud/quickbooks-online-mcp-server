@@ -4,7 +4,9 @@ import {
   isToolDisabled,
   knownParamKeys,
   permissiveParamsSchema,
+  READ_ONLY_TOOL_ALLOWLIST,
   RegisterTool,
+  SANDBOX_WRITE_EXCEPTIONS,
   unsupportedParamsWarning,
 } from "../../../src/helpers/register-tool";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -31,10 +33,9 @@ describe("getCrudCategory", () => {
 });
 
 // ── isToolDisabled ───────────────────────────────────────────────────────────
-// Verifies that the correct env var name gates each CRUD category.
-// Uses literal env var names ("QUICKBOOKS_DISABLE_WRITE" etc.) so the test catches any
-// mismatch between the documented env var and what the implementation reads.
-// afterEach deletes all three vars to prevent state leaking between tests.
+// This fork does not consult QUICKBOOKS_DISABLE_*. Mutating tools stay
+// unregistered even when those variables are "false" or unset. Read tools
+// register only from the explicit allowlist.
 
 describe("isToolDisabled", () => {
   afterEach(() => {
@@ -43,35 +44,54 @@ describe("isToolDisabled", () => {
     delete process.env["QUICKBOOKS_DISABLE_DELETE"];
   });
 
-  // READ tools must never be suppressed regardless of env state.
-  it("returns false for READ tool with no env vars set", () =>
-    expect(isToolDisabled("get_invoice")).toBe(false));
+  it("keeps the future write-exception list empty", () => {
+    expect(SANDBOX_WRITE_EXCEPTIONS).toEqual([]);
+    expect(SANDBOX_WRITE_EXCEPTIONS).not.toContain("create_deposit");
+  });
 
-  it("returns false for READ tool even when all DISABLE vars are true", () => {
+  it("returns false for an allowlisted READ tool with no env vars set", () =>
+    expect(isToolDisabled("read_invoice")).toBe(false));
+
+  it("returns false for an allowlisted READ tool even when all DISABLE vars are true", () => {
     process.env["QUICKBOOKS_DISABLE_WRITE"]  = "true";
     process.env["QUICKBOOKS_DISABLE_UPDATE"] = "true";
     process.env["QUICKBOOKS_DISABLE_DELETE"] = "true";
     expect(isToolDisabled("search_customers")).toBe(false);
+    expect(isToolDisabled("get_deposit")).toBe(false);
+    expect(isToolDisabled("search_deposits")).toBe(false);
   });
 
-  // WRITE — underscore and hyphen variants, both enabled and disabled states.
-  it("returns true for WRITE tool when QUICKBOOKS_DISABLE_WRITE=true",        () => { process.env["QUICKBOOKS_DISABLE_WRITE"]  = "true"; expect(isToolDisabled("create_invoice")).toBe(true); });
-  it("returns false for WRITE tool when QUICKBOOKS_DISABLE_WRITE unset",       () => expect(isToolDisabled("create_invoice")).toBe(false));
-  it("returns true for hyphen WRITE tool when QUICKBOOKS_DISABLE_WRITE=true",  () => { process.env["QUICKBOOKS_DISABLE_WRITE"]  = "true"; expect(isToolDisabled("create-bill")).toBe(true); });
+  it("returns true for WRITE, UPDATE, and DELETE tools even when DISABLE vars are unset or false", () => {
+    for (const name of ["create_invoice", "create-bill", "update_customer", "update-vendor", "delete_payment", "delete-bill", "create_deposit", "create_payment", "create_transfer", "update_company_info", "delete_customer"]) {
+      expect(isToolDisabled(name)).toBe(true);
+    }
+    process.env["QUICKBOOKS_DISABLE_WRITE"] = "false";
+    process.env["QUICKBOOKS_DISABLE_UPDATE"] = "false";
+    process.env["QUICKBOOKS_DISABLE_DELETE"] = "false";
+    expect(isToolDisabled("create_deposit")).toBe(true);
+    expect(isToolDisabled("create_payment")).toBe(true);
+    expect(isToolDisabled("delete_invoice")).toBe(true);
+  });
 
-  // UPDATE — underscore and hyphen variants, both enabled and disabled states.
-  it("returns true for UPDATE tool when QUICKBOOKS_DISABLE_UPDATE=true",       () => { process.env["QUICKBOOKS_DISABLE_UPDATE"] = "true"; expect(isToolDisabled("update_customer")).toBe(true); });
-  it("returns false for UPDATE tool when QUICKBOOKS_DISABLE_UPDATE unset",      () => expect(isToolDisabled("update_customer")).toBe(false));
-  it("returns true for hyphen UPDATE tool when QUICKBOOKS_DISABLE_UPDATE=true", () => { process.env["QUICKBOOKS_DISABLE_UPDATE"] = "true"; expect(isToolDisabled("update-vendor")).toBe(true); });
+  it('returns true for mutating tools when the old "true" / "1" values are set', () => {
+    process.env["QUICKBOOKS_DISABLE_WRITE"] = "true";
+    expect(isToolDisabled("create_invoice")).toBe(true);
+    process.env["QUICKBOOKS_DISABLE_WRITE"] = "1";
+    expect(isToolDisabled("create-bill")).toBe(true);
+  });
 
-  // DELETE — underscore and hyphen variants, both enabled and disabled states.
-  it("returns true for DELETE tool when QUICKBOOKS_DISABLE_DELETE=true",       () => { process.env["QUICKBOOKS_DISABLE_DELETE"] = "true"; expect(isToolDisabled("delete_payment")).toBe(true); });
-  it("returns false for DELETE tool when QUICKBOOKS_DISABLE_DELETE unset",      () => expect(isToolDisabled("delete_payment")).toBe(false));
-  it("returns true for hyphen DELETE tool when QUICKBOOKS_DISABLE_DELETE=true", () => { process.env["QUICKBOOKS_DISABLE_DELETE"] = "true"; expect(isToolDisabled("delete-bill")).toBe(true); });
+  it("would allow only a name placed in a future reviewed exception list", () => {
+    expect(isToolDisabled("create_deposit", ["create_deposit"])).toBe(false);
+    expect(isToolDisabled("create_payment", ["create_deposit"])).toBe(true);
+    expect(isToolDisabled("read_invoice", ["create_deposit"])).toBe(false);
+    expect(isToolDisabled("create_deposit")).toBe(true);
+  });
 
-  // Boundary: only the exact string "true" disables a tool; other truthy-ish values must not.
-  it('returns false when env var is "false"', () => { process.env["QUICKBOOKS_DISABLE_WRITE"] = "false"; expect(isToolDisabled("create_invoice")).toBe(false); });
-  it('returns false when env var is "1"',     () => { process.env["QUICKBOOKS_DISABLE_WRITE"] = "1";     expect(isToolDisabled("create_invoice")).toBe(false); });
+  it("returns true for a read-shaped name that is not on the allowlist", () => {
+    expect(isToolDisabled("get_not_a_real_tool")).toBe(true);
+    expect(READ_ONLY_TOOL_ALLOWLIST.has("get_customer")).toBe(true);
+    expect([...READ_ONLY_TOOL_ALLOWLIST].some((name) => /^(create_|create-|update_|update-|delete_|delete-)/.test(name))).toBe(false);
+  });
 });
 
 // ── RegisterTool ─────────────────────────────────────────────────────────────
@@ -95,7 +115,7 @@ describe("RegisterTool", () => {
   // Confirm all four ToolDefinition fields are forwarded to server.tool() unchanged.
   it("calls server.tool() with all definition fields when enabled", () => {
     const server = { tool: jest.fn() } as unknown as McpServer;
-    const d = def("get_invoice");
+    const d = def("read_invoice");
     RegisterTool(server, d);
     expect(server.tool).toHaveBeenCalledTimes(1);
     const [name, description, shape, handler] = (server.tool as jest.Mock).mock.calls[0] as any[];
@@ -108,23 +128,22 @@ describe("RegisterTool", () => {
     expect((shape.params as any).parse({ id: "1", unexpected_key: 1 }).unexpected_key).toBe(1);
   });
 
-  // One test per mutable category to confirm the early-return path is reached.
-  it("skips server.tool() for disabled WRITE tool", () => {
-    process.env["QUICKBOOKS_DISABLE_WRITE"] = "true";
+  // Mutating tools are skipped even when the legacy flags ask for them to be enabled.
+  it("skips server.tool() for a WRITE tool when DISABLE_WRITE is false", () => {
+    process.env["QUICKBOOKS_DISABLE_WRITE"] = "false";
     const server = { tool: jest.fn() } as unknown as McpServer;
     RegisterTool(server, def("create_invoice"));
     expect(server.tool).not.toHaveBeenCalled();
   });
 
-  it("skips server.tool() for disabled UPDATE tool", () => {
-    process.env["QUICKBOOKS_DISABLE_UPDATE"] = "true";
+  it("skips server.tool() for an UPDATE tool when the disable flag is unset", () => {
     const server = { tool: jest.fn() } as unknown as McpServer;
     RegisterTool(server, def("update_customer"));
     expect(server.tool).not.toHaveBeenCalled();
   });
 
-  it("skips server.tool() for disabled DELETE tool", () => {
-    process.env["QUICKBOOKS_DISABLE_DELETE"] = "true";
+  it("skips server.tool() for a DELETE tool when DISABLE_DELETE is false", () => {
+    process.env["QUICKBOOKS_DISABLE_DELETE"] = "false";
     const server = { tool: jest.fn() } as unknown as McpServer;
     RegisterTool(server, def("delete_payment"));
     expect(server.tool).not.toHaveBeenCalled();
@@ -141,10 +160,11 @@ describe("RegisterTool", () => {
   });
 
   // Confirm the legacy hyphen separator is handled by the early-return path.
-  it("skips hyphen-prefixed WRITE tool when QUICKBOOKS_DISABLE_WRITE=true", () => {
-    process.env["QUICKBOOKS_DISABLE_WRITE"] = "true";
+  it("skips hyphen-prefixed WRITE tools and create_deposit", () => {
+    process.env["QUICKBOOKS_DISABLE_WRITE"] = "false";
     const server = { tool: jest.fn() } as unknown as McpServer;
     RegisterTool(server, def("create-bill"));
+    RegisterTool(server, def("create_deposit"));
     expect(server.tool).not.toHaveBeenCalled();
   });
 });
@@ -170,11 +190,11 @@ describe("unsupported parameter reporting", () => {
 
   it("names an unsupported parameter in the response", async () => {
     const { result } = await runRegistered(
-      "create_invoice",
+      "read_invoice",
       z.object({ customer_ref: z.string() }),
       { customer_ref: "1", ship_date: "2026-09-01" }
     );
-    expect(result.content[0].text).toContain("create_invoice does not support");
+    expect(result.content[0].text).toContain("read_invoice does not support");
     expect(result.content[0].text).toContain("ship_date");
     expect(result.content[0].text).toContain("customer_ref"); // lists what IS supported
     expect(result.content[1].text).toBe("ok"); // original response preserved

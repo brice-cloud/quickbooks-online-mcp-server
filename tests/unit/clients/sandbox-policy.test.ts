@@ -3,7 +3,10 @@ import {
   armOAuthTimeout,
   assertSandboxEnvironment,
   failClosed,
+  isLocalhostCallbackHost,
+  isLoopbackRemoteAddress,
   OAUTH_CALLBACK_TIMEOUT_MS,
+  OAUTH_REDIRECT_URI,
   readAndApplyTokenFile,
   statesMatch,
 } from "../../../src/clients/sandbox-policy";
@@ -46,7 +49,7 @@ describe("readAndApplyTokenFile", () => {
         "QUICKBOOKS_CLIENT_SECRET=file-secret",
         "QUICKBOOKS_REFRESH_TOKEN=file-refresh",
         "QUICKBOOKS_REALM_ID=file-realm",
-        "QUICKBOOKS_REDIRECT_URI=http://127.0.0.1:8000/callback",
+        "QUICKBOOKS_REDIRECT_URI=http://localhost:8000/callback",
         "QUICKBOOKS_ENVIRONMENT=sandbox",
         "QUICKBOOKS_DISABLE_WRITE=false",
         "QUICKBOOKS_DISABLE_UPDATE=false",
@@ -63,7 +66,7 @@ describe("readAndApplyTokenFile", () => {
     expect(env.QUICKBOOKS_CLIENT_SECRET).toBe("file-secret");
     expect(env.QUICKBOOKS_REFRESH_TOKEN).toBe("file-refresh");
     expect(env.QUICKBOOKS_REALM_ID).toBe("file-realm");
-    expect(env.QUICKBOOKS_REDIRECT_URI).toBe("http://127.0.0.1:8000/callback");
+    expect(env.QUICKBOOKS_REDIRECT_URI).toBe("http://localhost:8000/callback");
     expect(env.QUICKBOOKS_ENVIRONMENT).toBeUndefined();
     expect(env.QUICKBOOKS_DISABLE_WRITE).toBe("true");
     expect(env.QBO_PDF_OUTPUT_DIR).toBe("");
@@ -99,6 +102,30 @@ describe("readAndApplyTokenFile", () => {
     const env: NodeJS.ProcessEnv = { QUICKBOOKS_REFRESH_TOKEN: "keep-me" };
     readAndApplyTokenFile("QUICKBOOKS_REFRESH_TOKEN=   \n", env, parse, "token file");
     expect(env.QUICKBOOKS_REFRESH_TOKEN).toBe("keep-me");
+  });
+});
+
+describe("localhost OAuth callback address", () => {
+  it("uses the hostname redirect Intuit accepts", () => {
+    expect(OAUTH_REDIRECT_URI).toBe("http://localhost:8000/callback");
+  });
+
+  it("accepts only loopback peers and the localhost host header", () => {
+    expect(isLoopbackRemoteAddress("127.0.0.1")).toBe(true);
+    expect(isLoopbackRemoteAddress("::1")).toBe(true);
+    expect(isLoopbackRemoteAddress("::ffff:127.0.0.1")).toBe(true);
+    expect(isLoopbackRemoteAddress("203.0.113.5")).toBe(false);
+    expect(isLoopbackRemoteAddress("::")).toBe(false);
+    expect(isLoopbackRemoteAddress(undefined)).toBe(false);
+
+    expect(isLocalhostCallbackHost("localhost:8000")).toBe(true);
+    expect(isLocalhostCallbackHost("LocalHost:8000")).toBe(true);
+    expect(isLocalhostCallbackHost("127.0.0.1:8000")).toBe(false);
+    expect(isLocalhostCallbackHost("[::1]:8000")).toBe(false);
+    expect(isLocalhostCallbackHost("localhost:80")).toBe(false);
+    expect(isLocalhostCallbackHost("evil.example:8000")).toBe(false);
+    expect(isLocalhostCallbackHost(undefined)).toBe(false);
+    expect(isLocalhostCallbackHost("localhost:9", 9)).toBe(true);
   });
 });
 

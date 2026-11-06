@@ -51,7 +51,10 @@ jest.unstable_mockModule('intuit-oauth', () => {
     cfg: Record<string, unknown>;
     refreshUsingToken = jest.fn((token: string) => refreshDispatch(token));
     createToken = jest.fn((url: string) => createTokenDispatch(url));
-    authorizeUri = jest.fn(() => 'https://appcenter.intuit.com/connect/oauth2?mock');
+    authorizeUri = jest.fn((params: { state?: string }) => {
+      const redirect = String(this.cfg.redirectUri ?? '');
+      return `https://appcenter.intuit.com/connect/oauth2?redirect_uri=${encodeURIComponent(redirect)}&state=${params?.state ?? ''}`;
+    });
     constructor(cfg: Record<string, unknown>) {
       this.cfg = cfg;
       oauthInstances.push(this as unknown as MockOAuth);
@@ -169,9 +172,13 @@ describe('QuickbooksClient.authenticate', () => {
     // redirect (NOT the playground URI from the environment).
     expect(oauthInstances).toHaveLength(2);
     const flowClient = oauthInstances[1];
-    expect(flowClient.cfg.redirectUri).toBe('http://127.0.0.1:8000/callback');
+    expect(flowClient.cfg.redirectUri).toBe('http://localhost:8000/callback');
     expect(flowClient.cfg.environment).toBe('sandbox');
     expect(fakeServer.listen).toHaveBeenCalledWith(8000, '127.0.0.1', expect.any(Function));
+    expect(fakeServer.listen).toHaveBeenCalledWith(8000, '::1', expect.any(Function));
+    expect(String(flowClient.authorizeUri.mock.results[0]?.value)).toContain(
+      encodeURIComponent('http://localhost:8000/callback')
+    );
 
     // The state actually used is a random per-run value, not a fixed literal —
     // read it off the authorizeUri() call so the simulated callback matches it.
@@ -182,7 +189,7 @@ describe('QuickbooksClient.authenticate', () => {
     // Simulate the user completing authorization in the browser: Intuit
     // redirects to the local callback server with that same state echoed back.
     const res = { writeHead: jest.fn(), end: jest.fn() };
-    await callbackHandler!({ url: `/callback?code=abc&state=${state}`, method: 'GET' }, res);
+    await callbackHandler!(callbackRequest(`/callback?code=abc&state=${state}`), res);
 
     await authPromise;
 
@@ -213,9 +220,73 @@ describe('QuickbooksClient.authenticate', () => {
     // e.g. a replayed URL, or another concurrent auth attempt — must be
     // rejected with 400, and the code must never reach createToken().
     const res = { writeHead: jest.fn(), end: jest.fn() };
-    await callbackHandler!({ url: '/callback?code=abc&state=not-the-real-state', method: 'GET' }, res);
+    await callbackHandler!(callbackRequest('/callback?code=abc&state=not-the-real-state'), res);
 
     expect(res.writeHead).toHaveBeenCalledWith(400, { 'Content-Type': 'text/plain' });
     expect(createTokenDispatch).not.toHaveBeenCalled();
   });
+
+  it('rejects a callback whose Host is an IP or whose socket is not loopback', async () => {
+    resetAuthState();
+    refreshDispatch.mockRejectedValueOnce(new Error('invalid_grant'));
+    callbackHandler = undefined;
+    void quickbooksClient.authenticate().catch(() => {});
+    await untilCallbackRegistered();
+
+    const ipHost = { writeHead: jest.fn(), end: jest.fn() };
+    await callbackHandler!(callbackRequest('/callback?code=abc&state=anything', '127.0.0.1', '127.0.0.1:8000'), ipHost);
+    expect(ipHost.writeHead).toHaveBeenCalledWith(403, { 'Content-Type': 'text/plain' });
+
+    const publicPeer = { writeHead: jest.fn(), end: jest.fn() };
+    await callbackHandler!(callbackRequest('/callback?code=abc&state=anything', '203.0.113.5'), publicPeer);
+    expect(publicPeer.writeHead).toHaveBeenCalledWith(403, { 'Content-Type': 'text/plain' });
+    expect(createTokenDispatch).not.toHaveBeenCalled();
+  });
+
+  it('accepts the same state from an IPv6 loopback socket', async () => {
+    resetAuthState();
+    refreshDispatch
+      .mockRejectedValueOnce(new Error('invalid_grant'))
+      .mockResolvedValueOnce({
+        token: { access_token: 'access-v6', expires_in: 3600, refresh_token: 'rotated-v6' },
+      });
+    createTokenDispatch.mockResolvedValueOnce({
+      token: { refresh_token: 'flow-refresh-v6', realmId: '12345' },
+    });
+    callbackHandler = undefined;
+    const authPromise = quickbooksClient.authenticate();
+    await untilCallbackRegistered();
+    const flowClient = oauthInstances[oauthInstances.length - 1];
+    await untilAuthorizeUriCalled(flowClient);
+    const { state } = (flowClient.authorizeUri.mock.calls[0][0] as { state: string });
+    const res = { writeHead: jest.fn(), end: jest.fn() };
+    await callbackHandler!(callbackRequest(`/callback?code=abc&state=${state}`, '::1'), res);
+    await authPromise;
+    expect(res.writeHead).toHaveBeenCalledWith(200, { 'Content-Type': 'text/html' });
+    expect(flowClient.createToken).toHaveBeenCalledTimes(1);
+  }, 15000);
 });
+
+function resetAuthState() {
+  const client = quickbooksClient as unknown as {
+    accessTokenExpiry?: Date;
+    isAuthenticating?: boolean;
+    authInFlight?: Promise<unknown>;
+    refreshInFlight?: Promise<unknown>;
+    refreshToken?: string;
+  };
+  client.accessTokenExpiry = new Date(0);
+  client.isAuthenticating = false;
+  client.authInFlight = undefined;
+  client.refreshInFlight = undefined;
+  client.refreshToken = 'stale-refresh-token';
+}
+
+function callbackRequest(url: string, remoteAddress = '127.0.0.1', host = 'localhost:8000') {
+  return {
+    url,
+    method: 'GET',
+    headers: { host },
+    socket: { remoteAddress },
+  };
+}

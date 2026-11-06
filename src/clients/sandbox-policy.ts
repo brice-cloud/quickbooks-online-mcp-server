@@ -11,10 +11,28 @@ import { timingSafeEqual } from "crypto";
 
 export const SANDBOX_ENVIRONMENT = "sandbox";
 export const SANDBOX_API_HOST = "sandbox-quickbooks.api.intuit.com";
-export const OAUTH_BIND_HOST = "127.0.0.1";
 export const OAUTH_PORT = 8000;
-export const OAUTH_REDIRECT_URI = `http://${OAUTH_BIND_HOST}:${OAUTH_PORT}/callback`;
+/**
+ * Hostname form required by Intuit's developer UI. An IP literal such as
+ * 127.0.0.1 is rejected as a redirect URI. Authorize and token exchange both
+ * use this exact string.
+ */
+export const OAUTH_REDIRECT_URI = `http://localhost:${OAUTH_PORT}/callback`;
+/** Socket addresses only. `::` and `0.0.0.0` are not included. */
+export const OAUTH_LOOPBACK_HOSTS = ["127.0.0.1", "::1"] as const;
 export const OAUTH_CALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
+
+export function isLoopbackRemoteAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  const normalized = address.toLowerCase();
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "::ffff:127.0.0.1";
+}
+
+/** Host header must be the registered localhost name and port, not an IP. */
+export function isLocalhostCallbackHost(hostHeader: string | undefined, port: number = OAUTH_PORT): boolean {
+  if (!hostHeader) return false;
+  return hostHeader.trim().toLowerCase() === `localhost:${port}`;
+}
 
 /** Credential keys the token file may set. Security policy keys are absent on purpose. */
 export const TOKEN_FILE_KEYS = [

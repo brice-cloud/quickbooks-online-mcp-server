@@ -404,7 +404,7 @@ QUICKBOOKS_ENVIRONMENT=sandbox
 ### Common pitfalls
 
 - **`.env` loaded from the wrong directory.** The server resolves the token file from `QUICKBOOKS_TOKEN_STORE_PATH` or from the compiled module, not from the shell's CWD.
-- **Redirect URI mismatch.** The interactive flow uses `http://127.0.0.1:8000/callback` and listens on `127.0.0.1` only. Register that exact URI on the sandbox app.
+- **Redirect URI mismatch.** Register exactly `http://localhost:8000/callback`. Intuit's developer UI rejects an IP address in the redirect URI. The process still listens only on `127.0.0.1` and `::1`.
 
 ---
 

@@ -13,7 +13,7 @@ These do not depend on a README flag or on `QUICKBOOKS_DISABLE_*`.
 | Accounting host | After the check passes, the client passes `useSandbox: true` to `node-quickbooks`. The attachable upload throws if `isSandbox` is not `true` and otherwise uses only `sandbox-quickbooks.api.intuit.com`. |
 | Tool registration | `READ_ONLY_TOOL_ALLOWLIST` is the only read set. Names starting with `create_`, `create-`, `update_`, `update-`, `delete_`, or `delete-` are not registered. `SANDBOX_WRITE_EXCEPTIONS` is an empty frozen list. Adding `create_deposit` later is a reviewed code change to that list, not an environment variable. |
 | Credential file keys | The token file may set client id, client secret, refresh token, realm id, and redirect URI. It does not set `QUICKBOOKS_DISABLE_*`, `QBO_PDF_OUTPUT_DIR`, or `QUICKBOOKS_TOKEN_STORE_PATH`. |
-| OAuth listener | Bound to `127.0.0.1:8000` only. Redirect is `http://127.0.0.1:8000/callback`. `state` is compared with `crypto.timingSafeEqual`. The callback query string is not logged. The listener times out after five minutes. |
+| OAuth listener | Redirect registered with Intuit is exactly `http://localhost:8000/callback`. Sockets bind only `127.0.0.1:8000` and `::1:8000`, not `0.0.0.0` or `::`. The Host header must be `localhost:8000`, and the peer address must be loopback. `state` is compared with `crypto.timingSafeEqual`. The callback query string is not logged. The listener times out after five minutes. |
 | Token lock | A `*.lock` file is held across one refresh and its write. The write renames a temp file onto the resolved target, including symlink targets. |
 | Fatal config | Missing client id or secret, a relative token path, an unreadable token file, and a bad environment exit 1. The old `uncaughtException` logger that could leave exit code 0 is gone. |
 
@@ -47,4 +47,4 @@ The full install, including devDependencies, still reports `handlebars` critical
 
 ## Activation
 
-Do not point this fork at production credentials. Do not treat a green test run as permission to merge to Intuit or to install it on a shared host until the audit section of the pull request is read. Sandbox reads still require a human sandbox OAuth handshake on a machine where `127.0.0.1:8000` is the callback.
+Do not point this fork at production credentials. Do not treat a green test run as permission to merge to Intuit or to install it on a shared host until the audit section of the pull request is read. Sandbox reads still require a human sandbox OAuth handshake. Register exactly `http://localhost:8000/callback` on the sandbox app. The process listens on loopback only.

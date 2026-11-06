@@ -11,10 +11,12 @@ import {
   armOAuthTimeout,
   assertSandboxEnvironment,
   failClosed,
-  OAUTH_BIND_HOST,
   OAUTH_CALLBACK_TIMEOUT_MS,
+  OAUTH_LOOPBACK_HOSTS,
   OAUTH_PORT,
   OAUTH_REDIRECT_URI,
+  isLocalhostCallbackHost,
+  isLoopbackRemoteAddress,
   readAndApplyTokenFile,
   SANDBOX_API_HOST,
   SANDBOX_ENVIRONMENT,
@@ -292,8 +294,9 @@ export class QuickbooksClient {
     this.isAuthenticating = true;
     const port = OAUTH_PORT;
 
-    // The callback listener is bound to loopback only. The redirect sent to
-    // Intuit is the same loopback URI, not whatever QUICKBOOKS_REDIRECT_URI says.
+    // Intuit's developer UI accepts http://localhost:8000/callback and rejects
+    // an IP literal. The sockets below are still loopback-only. The flow
+    // ignores QUICKBOOKS_REDIRECT_URI so authorize and token exchange match.
     const flowClient = new OAuthClient({
       clientId: this.clientId,
       clientSecret: this.clientSecret,
@@ -311,10 +314,9 @@ export class QuickbooksClient {
         fn();
       };
 
-      // Guard against duplicate /callback requests for the same authorization
-      // code. The listener is IPv4 loopback only. A replayed callback is still
-      // ignored. Exchanging a one-time auth code a second time trips Intuit's
-      // replay protection, which REVOKES the tokens issued by the first exchange
+      // Guard against duplicate /callback requests. localhost may connect to
+      // 127.0.0.1 and ::1, so the same code can arrive twice. Exchanging it
+      // twice trips Intuit's replay protection and REVOKES the first tokens
       // (RFC 6749 §4.1.2). Only the first callback may exchange the code.
       let codeExchangeStarted = false;
 
@@ -325,16 +327,33 @@ export class QuickbooksClient {
       // tokens written into our .env instead of ours.
       const expectedState = crypto.randomBytes(24).toString('hex');
 
-      // Create temporary server for OAuth callback
-      const server = http.createServer(async (req, res) => {
+      const servers: http.Server[] = [];
+      const closeServers = () => {
+        for (const openServer of servers) {
+          try { openServer.close(); } catch { /* already closed */ }
+        }
+      };
+
+      // Create temporary servers for the OAuth callback. One handler is shared.
+      const onRequest = async (req: http.IncomingMessage, res: http.ServerResponse) => {
         const callbackPath = req.url?.split('?')[0] ?? '';
         console.log(`[auth-server] ${req.method} ${callbackPath}`);
 
         // Respond to anything that isn't /callback so diagnostic probes (curl,
-        // ngrok health checks, favicon requests, etc.) don't hang the server.
+        // favicon requests, etc.) don't hang the server.
         if (!req.url?.startsWith('/callback')) {
           res.writeHead(404, { 'Content-Type': 'text/plain' });
           res.end('Not Found. Waiting for QuickBooks OAuth callback at /callback');
+          return;
+        }
+
+        // The socket must be loopback, and the Host header must be the
+        // registered hostname. An IP Host or a public Host is rejected even
+        // if it reached a loopback socket.
+        if (!isLoopbackRemoteAddress(req.socket?.remoteAddress) || !isLocalhostCallbackHost(req.headers?.host)) {
+          console.error('[auth-server] Rejected callback that was not addressed to localhost on a loopback socket');
+          res.writeHead(403, { 'Content-Type': 'text/plain' });
+          res.end('Forbidden.');
           return;
         }
 
@@ -396,7 +415,7 @@ export class QuickbooksClient {
             // Close server after a short delay
             setTimeout(() => {
               settle(() => {
-                server.close();
+                closeServers();
                 this.isAuthenticating = false;
                 resolve();
               });
@@ -427,12 +446,12 @@ export class QuickbooksClient {
             });
           }
         }
-      });
+      };
 
       cancelTimeout = armOAuthTimeout(() => {
         settle(() => {
           this.isAuthenticating = false;
-          server.close();
+          closeServers();
           reject(new Error(
             `QuickBooks sandbox OAuth timed out after ${OAUTH_CALLBACK_TIMEOUT_MS}ms ` +
               `waiting for ${OAUTH_REDIRECT_URI}.`
@@ -440,13 +459,10 @@ export class QuickbooksClient {
         });
       });
 
-      // Loopback only. Do not bind "::" or 0.0.0.0. The Intuit app must list
-      // OAUTH_REDIRECT_URI exactly. There is no public callback and no ngrok path.
-      server.listen(port, OAUTH_BIND_HOST, async () => {
-        const addr = server.address();
-        console.log(`[auth-server] Listening on ${typeof addr === 'string' ? addr : `${addr?.address}:${addr?.port}`} (family: ${typeof addr === 'object' ? addr?.family : 'n/a'})`);
-
-        // Generate authorization URL with proper type assertion
+      let announced = false;
+      const announce = async () => {
+        if (announced || settled) return;
+        announced = true;
         const authUri = flowClient.authorizeUri({
           scope: [OAuthClient.scopes.Accounting as string],
           state: expectedState
@@ -457,22 +473,38 @@ export class QuickbooksClient {
         console.log(authUri);
         console.log('\nWaiting for callback...\n');
 
-        // Attempt to open the browser automatically; ignore failures on headless systems
         try {
           await open(authUri);
         } catch {
           // Headless environment — user will open the URL manually
         }
-      });
+      };
 
-      // Handle server errors
-      server.on('error', (error) => {
-        console.error('Server error:', error);
-        settle(() => {
-          this.isAuthenticating = false;
-          reject(error);
+      // Loopback sockets only. Do not bind "::" or 0.0.0.0. localhost in the
+      // redirect may resolve to either address; both listeners share one handler.
+      for (const host of OAUTH_LOOPBACK_HOSTS) {
+        const server = http.createServer(onRequest);
+        servers.push(server);
+        server.on('error', (error: NodeJS.ErrnoException) => {
+          const ipv6Unavailable = host === '::1'
+            && (error.code === 'EAFNOSUPPORT' || error.code === 'EADDRNOTAVAIL' || error.code === 'EINVAL');
+          if (ipv6Unavailable) {
+            console.error(`[auth-server] IPv6 loopback is unavailable (${error.code}). Continuing on 127.0.0.1.`);
+            return;
+          }
+          console.error('Server error:', error);
+          settle(() => {
+            closeServers();
+            this.isAuthenticating = false;
+            reject(error);
+          });
         });
-      });
+        server.listen(port, host, () => {
+          const addr = server.address();
+          console.log(`[auth-server] Listening on ${typeof addr === 'string' ? addr : `${addr?.address}:${addr?.port}`} (family: ${typeof addr === 'object' ? addr?.family : 'n/a'})`);
+          void announce();
+        });
+      }
     });
   }
 

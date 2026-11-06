@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bind the OAuth callback to `127.0.0.1:8000`, compare `state` with `timingSafeEqual`, redact the callback query from logs, and time out the listener.
 - Lock the token file across refresh and persist, and rename onto the resolved token path.
 - Fatal configuration calls `process.exit(1)` instead of an `uncaughtException` handler that could exit 0.
-- Override patched `axios`, `follow-redirects`, `proxy-addr`, `body-parser`, and `decode-uri-component` where the existing majors allow it. Bump `@modelcontextprotocol/sdk` to 1.32.2. Zod 3 remains; see `docs/SANDBOX_FORK_SECURITY.md`.
+- Override patched `axios`, `follow-redirects`, `proxy-addr`, `body-parser`, and `decode-uri-component` where the existing majors allow it. Bump `@modelcontextprotocol/sdk` to 1.32.2.
+- Depend on Zod 4.6.7. GitHub advisory GHSA-mrhx-c7xc-m3w5 is fixed starting at 4.6.6. `z.record(value)` call sites now pass an explicit string key schema, which is what Zod 4 requires and what Zod 3's one-argument record meant.
 
 ## [0.0.1] - 2024-01-13
 

@@ -205,4 +205,74 @@ describe("compiled sandbox fork startup", () => {
     expect(names).toContain("get_balance_sheet");
     expect(names.filter((name) => /match|bank/i.test(name))).toEqual([]);
   });
+
+  it("rejects a malformed read call before the network and blocks a well-typed fake read", async () => {
+    const child = spawn(process.execPath, ["--import", fence, entry], {
+      cwd: root,
+      env: childEnv({
+        ...baseCreds,
+        QUICKBOOKS_ENVIRONMENT: "sandbox",
+        QUICKBOOKS_DISABLE_WRITE: "false",
+        QUICKBOOKS_TOKEN_STORE_PATH: tempFile("QUICKBOOKS_ENVIRONMENT=sandbox\nQUICKBOOKS_DISABLE_WRITE=false\n"),
+      }),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    const lines = createInterface({ input: child.stdout });
+    const pending = new Map<number, (message: { error?: unknown; result?: { isError?: boolean; content?: { text?: string }[] } }) => void>();
+    const waitFor = (id: number) =>
+      new Promise<{ error?: unknown; result?: { isError?: boolean; content?: { text?: string }[] } }>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`id ${id} timed out\n${stderr}`)), 8000);
+        pending.set(id, (message) => {
+          clearTimeout(timer);
+          resolve(message);
+        });
+      });
+    lines.on("line", (line) => {
+      const message = JSON.parse(line) as { id?: number };
+      if (typeof message.id === "number" && pending.has(message.id)) {
+        pending.get(message.id)!(message as never);
+        pending.delete(message.id);
+      }
+    });
+    const send = (payload: unknown) => child.stdin.write(`${JSON.stringify(payload)}\n`);
+    send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        capabilities: {},
+        clientInfo: { name: "sandbox-guard", version: "0" },
+      },
+    });
+    send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    await waitFor(1);
+
+    const malformed = waitFor(3);
+    send({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "get_customer", arguments: { params: { id: 1 } } },
+    });
+    const malformedReply = await malformed;
+    expect(JSON.stringify(malformedReply)).toMatch(/invalid|expected string|Expected string|error/i);
+    expect(stderr).not.toMatch(/BLOCKED_/);
+
+    const typed = waitFor(4);
+    send({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "get_customer", arguments: { params: { id: "placeholder-id" } } },
+    });
+    const typedReply = await typed;
+    expect(stderr).toMatch(/BLOCKED_/);
+    expect(JSON.stringify(typedReply)).not.toMatch(/CompanyName|placeholder-realm-data/);
+    child.kill("SIGKILL");
+  });
 });

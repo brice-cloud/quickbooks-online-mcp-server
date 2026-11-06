@@ -28,12 +28,12 @@ These do not depend on a README flag or on `QUICKBOOKS_DISABLE_*`.
 
 Overrides and the SDK bump are compatible-version fixes. They are not `npm audit --force`, and nothing in npm config hides findings. Re-run `npm audit --omit=dev` on this lockfile before activation.
 
-Production audit after these overrides reported one high and one moderate:
+Production `npm audit --omit=dev` after the Zod 4.6.7 upgrade reports one moderate and no high or critical findings:
 
-- **High, activation caution:** `zod@3.25.76`, [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5). The published fix is Zod 4.6.7, a different major. This fork still uses Zod 3 because tool schemas and `knownParamKeys` are written for it. A hostile `tools/call` payload can exhaust memory in the validator. That should block exposing the process to an untrusted MCP client. It does not bypass the sandbox host check or the tool allowlist. It is the remaining production high.
+- **Zod:** [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5) covers npm `zod` versions `< 4.6.6`. The advisory's first patched version is `4.6.6`. This fork depends on `4.6.7`, the current published release at or after that patch. The patch checks `.max()`, `.length()`, and `.size()` before walking elements. An array schema with no size bound can still emit one issue per bad element. Do not treat the upgrade as a cap on every unconstrained array.
 - **Moderate, not an activation blocker by itself:** `fast-uri@3.1.7` via `ajv` inside `@modelcontextprotocol/sdk`. The fixed line is fast-uri 4.x. Ajv 8 depends on fast-uri 3, so this fork does not force the major. It is not the Intuit HTTP client.
 
-Cleared on the production tree by the lockfile, and previously high or critical on the auth or HTTP path: `axios@1.21.0`, `follow-redirects@1.16.2`, `proxy-addr@2.0.8`, `body-parser@2.4.0`, `decode-uri-component@0.5.1`, `@modelcontextprotocol/sdk@1.32.2`, `hono@4.13.16`, `@hono/node-server@2.1.6`, `ip-address@10.7.6`. `intuit-oauth@4.2.5` still uses `query-string` 6; the decode-uri-component override is what removed that high from the production audit.
+Cleared on the production tree, including the SDK and `zod-to-json-schema` paths, which resolve to the same `zod@4.6.7`: `axios@1.21.0`, `follow-redirects@1.16.2`, `proxy-addr@2.0.8`, `body-parser@2.4.0`, `decode-uri-component@0.5.1`, `@modelcontextprotocol/sdk@1.32.2`, `hono@4.13.16`, `@hono/node-server@2.1.6`, `ip-address@10.7.6`. `intuit-oauth@4.2.5` still uses `query-string` 6; the decode-uri-component override is what removed that high from the production audit.
 
 The full install, including devDependencies, still reports `handlebars` critical and `brace-expansion` high. Those are test and lint tools. They are not in `npm ci --omit=dev` and they are not in the runtime archive. They are not waived.
 
